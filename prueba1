@@ -1,0 +1,139 @@
+# ==========================================
+# ==========   IMPORTS & SETUP   ===========
+# ==========================================
+import yfinance as yf
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.model_selection import train_test_split
+from sklearn.svm import SVC
+from sklearn.metrics import accuracy_score, precision_score
+
+# Función auxiliar para RSI (Relative Strength Index)
+def calculate_rsi(data, window=14):
+    delta = data.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=window).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=window).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
+# ==========================================
+# ==========   1. MACRO DATA COMPLEX  ======
+# ==========================================
+print("1. Descargando Cluster Macroeconómico...")
+# ^TNX: Bonos 10y, ^VIX: Miedo, CL=F: Petróleo, GC=F: Oro
+macro_tickers = ["^TNX", "^VIX", "CL=F", "GC=F"] 
+macro = yf.download(macro_tickers, period="7y", interval="1d", progress=False)['Close']
+macro = macro.ffill()
+
+# Ingeniería de Features Macro
+macro_feats = pd.DataFrame()
+macro_feats["Rates_Chg"] = macro["^TNX"].diff()      # Cambio en tasas
+macro_feats["VIX"]       = macro["^VIX"]             # Nivel de miedo
+macro_feats["Oil_Ret"]   = macro["CL=F"].pct_change() # Retorno Petróleo
+macro_feats["Gold_Ret"]  = macro["GC=F"].pct_change() # Retorno Oro
+
+# Agregamos Lags Macro (¿Qué pasó con el petróleo ayer?)
+for col in macro_feats.columns:
+    macro_feats[f"{col}_lag1"] = macro_feats[col].shift(1)
+
+# ==========================================
+# ==========   2. DATA DE ACCIONES  ========
+# ==========================================
+tickers = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "AMD"]
+all_data = []
+
+print(f"2. Procesando Acciones con Memoria Temporal...")
+
+for t in tickers:
+    df = yf.download(t, period="7y", interval="1d", progress=False, auto_adjust=True)
+    if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+    
+    # --- A. Variables Base ---
+    df["Ret"] = df["Close"].pct_change()
+    df["Vol_5"] = df["Ret"].rolling(5).std()
+    df["RSI"] = calculate_rsi(df["Close"], window=14)
+    
+    # Distancia a Medias (Tendencia)
+    df["Dist_MA20"] = (df["Close"] - df["Close"].rolling(20).mean()) / df["Close"]
+    df["Dist_MA50"] = (df["Close"] - df["Close"].rolling(50).mean()) / df["Close"]
+    
+    # --- B. INYECCIÓN DE MEMORIA (LAGS) ---
+    # El modelo verá lo que pasó hoy, ayer (t-1), anteayer (t-2) y hace 3 días (t-3)
+    features_to_lag = ["Ret", "Vol_5", "RSI"]
+    for f in features_to_lag:
+        for lag in [1, 2, 3]:
+            df[f"{f}_lag{lag}"] = df[f].shift(lag)
+            
+    # --- C. FUSIÓN MACRO ---
+    df = df.merge(macro_feats, left_index=True, right_index=True, how="left")
+    
+    # Target
+    df["Target"] = (df["Close"].shift(-1) > df["Close"]).astype(int)
+    
+    df = df.dropna()
+    all_data.append(df)
+
+df_big = pd.concat(all_data)
+
+# ==========================================
+# ==========   3. DEFINICIÓN X e Y   =======
+# ==========================================
+# Excluimos columnas de precio absoluto o que no sean features
+drop_cols = ["Open", "High", "Low", "Close", "Volume", "Target"]
+# Seleccionamos dinámicamente todas las columnas numéricas que restan
+X = df_big.drop(columns=[c for c in df_big.columns if c in drop_cols])
+y = df_big["Target"]
+
+print(f"--> Total de Features generados: {X.shape[1]}")
+
+# ==========================================
+# ==========   4. SPLIT & SCALING   ========
+# ==========================================
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, shuffle=False
+)
+
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train)
+X_test_scaled = scaler.transform(X_test)
+
+# ==========================================
+# ==========   5. PCA (REDUCCIÓN)   ========
+# ==========================================
+# Aquí está la magia: Tenemos muchas columnas correlacionadas.
+# PCA debe comprimirlas. Pedimos 95% de varianza.
+pca = PCA(n_components=0.95)
+X_train_pca = pca.fit_transform(X_train_scaled)
+X_test_pca = pca.transform(X_test_scaled)
+
+print(f"--> Dimensiones reducidas por PCA: De {X_train.shape[1]} a {pca.n_components_}")
+
+# ==========================================
+# ==========   6. ENTRENAMIENTO DOBLE  =====
+# ==========================================
+print("Entrenando Modelos (esto puede tardar unos segundos)...")
+
+# Modelo A: Full Dimension (Fuerza Bruta)
+clf_full = SVC(kernel='rbf', C=1, gamma='scale', random_state=42)
+clf_full.fit(X_train_scaled, y_train)
+pred_full = clf_full.predict(X_test_scaled)
+
+# Modelo B: PCA (Inteligente)
+clf_pca = SVC(kernel='rbf', C=1, gamma='scale', random_state=42)
+clf_pca.fit(X_train_pca, y_train)
+pred_pca = clf_pca.predict(X_test_pca)
+
+# ==========================================
+# ==========   7. RESULTADOS   =============
+# ==========================================
+results = pd.DataFrame({
+    "Modelo": ["SVM Full (Sin PCA)", "SVM Compacto (Con PCA)"],
+    "Features": [X_train.shape[1], pca.n_components_],
+    "Accuracy": [accuracy_score(y_test, pred_full), accuracy_score(y_test, pred_pca)],
+    "Precision": [precision_score(y_test, pred_full), precision_score(y_test, pred_pca)]
+})
+
+print("\n===== RESULTADOS EXPERIMENTO COMPLEJO =====")
+print(results)
